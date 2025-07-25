@@ -1,0 +1,103 @@
+.info-page {
+  min-height: 100vh;
+  background: #f7fafc;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding-top: 48px;
+}
+
+.title {
+  font-size: 2.5rem;
+  color: #2d3748;
+  margin-bottom: 32px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.info-form {
+  background: #fff;
+  padding: 32px 24px;
+  border-radius: 16px;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  max-width: 420px;
+  margin-bottom: 36px;
+}
+
+.form-label {
+  font-size: 1.1rem;
+  color: #4a5568;
+  font-weight: 500;
+  margin-bottom: 6px;
+  text-align: left;
+}
+
+.input-area {
+  width: 100%;
+  font-size: 1.1rem;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  resize: vertical;
+  background: #f1f5f9;
+  color: #2d3748;
+  outline: none;
+  margin-bottom: 8px;
+}
+.input-area:focus {
+  border-color: #3182ce;
+  background: #e2e8f0;
+}
+
+.file-input {
+  font-size: 1rem;
+  margin-bottom: 8px;
+}
+
+.submit-btn {
+  background: #3182ce;
+  color: #fff;
+  font-size: 1.1rem;
+  padding: 12px 0;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.submit-btn:disabled {
+  background: #90cdf4;
+  cursor: not-allowed;
+}
+.submit-btn:not(:disabled):hover {
+  background: #2563eb;
+}
+
+.extracted-section {
+  width: 100%;
+  max-width: 420px;
+  margin-bottom: 32px;
+}
+
+.extracted-section h2 {
+  font-size: 1.3rem;
+  color: #2d3748;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.extracted-box {
+  min-height: 80px;
+  background: #edf2f7;
+  border-radius: 8px;
+  padding: 16px;
+  color: #2d3748;
+  font-size: 1.1rem;
+  text-align: left;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
