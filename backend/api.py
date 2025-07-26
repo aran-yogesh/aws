@@ -8,6 +8,14 @@ import gridfs
 import os
 from datetime import datetime, timedelta
 from typing import Optional
+import boto3
+import json
+import time
+import io
+import base64
+import requests
+from google.cloud import speech
+from google.cloud import storage
 
 app = FastAPI()
 
@@ -28,8 +36,155 @@ patients_col = db['patients']
 medicines_col = db['medicines']
 appointments_col = db['appointments']
 logs_col = db['logs']
+onboarding_col = db['onboarding_data']  # New collection for onboarding data
 fs = gridfs.GridFS(db)
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# AWS Bedrock setup
+bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+# NLX Configuration
+NLX_API_KEY = 'cQionHIxPViK883m1oKCnEXpRiIJ4jp2'  # Your NLX API key
+NLX_BASE_URL = 'https://api.nlx.ai'  # NLX API base URL
+NLX_WEBHOOK_URL = 'https://apps.nlx.ai/c/xB8DIIPgVajzjP2XudKqk/gbQy3AoiJgBqUHvJLt7DE'  # Your NLX webhook URL
+NLX_DEPLOYMENT_KEY = 'xB8DIIPgVajzjP2XudKqk'  # Your deployment key
+NLX_CHANNEL_KEY = 'gbQy3AoiJgBqUHvJLt7DE'  # Your channel key
+NLX_ENABLED = True  # Enable NLX integration
+
+def schedule_nlx_appointment(appointment_data):
+    """Schedule appointment using NLX API"""
+    if not NLX_ENABLED:
+        return {"success": False, "error": "NLX API not configured"}
+    
+    try:
+        # Format appointment data for NLX using the correct API format
+        nlx_payload = {
+            "deploymentKey": NLX_DEPLOYMENT_KEY,
+            "channelKey": NLX_CHANNEL_KEY,
+            "input": {
+                "message": f"Schedule an appointment with {appointment_data.get('doctor', 'Doctor')} on {appointment_data.get('date')} at {appointment_data.get('time')} for {appointment_data.get('title', 'consultation')}",
+                "appointment_details": {
+                    "doctor": appointment_data.get('doctor'),
+                    "date": appointment_data.get('date'),
+                    "time": appointment_data.get('time'),
+                    "title": appointment_data.get('title', 'consultation'),
+                    "notes": appointment_data.get('notes', '')
+                }
+            }
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {NLX_API_KEY}",
+            "Content-Type": "application/json",
+            "X-API-Key": NLX_API_KEY
+        }
+        
+        # Try NLX API first, then webhook if API fails
+        response = None
+        error_msg = ""
+        
+        # Try API endpoint with different auth formats
+        api_headers_variants = [
+            {"Authorization": f"Bearer {NLX_API_KEY}", "Content-Type": "application/json"},
+            {"X-API-Key": NLX_API_KEY, "Content-Type": "application/json"},
+            {"Authorization": f"Basic {NLX_API_KEY}", "Content-Type": "application/json"},
+            {"Content-Type": "application/json"}
+        ]
+        
+        response = None
+        error_msg = ""
+        
+        for api_headers in api_headers_variants:
+            try:
+                response = requests.post(
+                    f"{NLX_BASE_URL}/api/chat",
+                    json=nlx_payload,
+                    headers=api_headers,
+                    timeout=30
+                )
+                if response.status_code == 200:
+                    break  # Success
+                else:
+                    error_msg = f"API error: {response.status_code} - {response.text}"
+            except Exception as e:
+                error_msg = f"API connection error: {str(e)}"
+                continue
+        
+        # If API failed, try webhook
+        if not response or response.status_code != 200:
+            try:
+                webhook_payload = {
+                    "deploymentKey": NLX_DEPLOYMENT_KEY,
+                    "channelKey": NLX_CHANNEL_KEY,
+                    "message": f"Schedule an appointment with {appointment_data.get('doctor', 'Doctor')} on {appointment_data.get('date')} at {appointment_data.get('time')} for {appointment_data.get('title', 'consultation')}"
+                }
+                
+                response = requests.post(
+                    NLX_WEBHOOK_URL,
+                    json=webhook_payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30
+                )
+                if response.status_code == 200:
+                    pass  # Success
+                else:
+                    error_msg += f" | Webhook error: {response.status_code} - {response.text}"
+            except Exception as e:
+                error_msg += f" | Webhook connection error: {str(e)}"
+        
+        # If both failed, return error
+        if not response or response.status_code != 200:
+            return {
+                "success": False,
+                "error": error_msg
+            }
+        
+        if response.status_code == 200:
+            result = response.json()
+            return {
+                "success": True,
+                "nlx_response": result,
+                "confirmation": "Appointment scheduled successfully via NLX",
+                "calendar_link": result.get("calendar_link", "")
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"NLX API error: {response.status_code} - {response.text}"
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error scheduling with NLX: {str(e)}"
+        }
+
+def call_bedrock_with_retry(request_body, max_retries=3, base_delay=1):
+    """Call Bedrock API with exponential backoff retry logic"""
+    for attempt in range(max_retries):
+        try:
+            response = bedrock.invoke_model(
+                modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+                body=json.dumps(request_body)
+            )
+            return response
+        except Exception as e:
+            if 'ThrottlingException' in str(e) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                print(f"Throttling detected, waiting {delay} seconds before retry {attempt + 1}")
+                time.sleep(delay)
+                continue
+            else:
+                raise e
+
+# Google Speech-to-Text setup
+try:
+    speech_client = speech.SpeechClient()
+    GOOGLE_SPEECH_AVAILABLE = True
+except Exception as e:
+    print(f"Google Speech-to-Text not available: {e}")
+    speech_client = None
+    GOOGLE_SPEECH_AVAILABLE = False
 
 # Pydantic models
 class LoginRequest(BaseModel):
@@ -69,6 +224,31 @@ class AppointmentModel(BaseModel):
     doctor: str
     notes: Optional[str] = None
 
+class VoiceAgentRequest(BaseModel):
+    patient_id: str
+    message: str
+    history: Optional[list] = []
+
+class AIAnalysisRequest(BaseModel):
+    text: str
+
+class AIAnalysisResponse(BaseModel):
+    extracted_info: dict
+    original_text: str
+
+class VoiceTranscriptionRequest(BaseModel):
+    audio_data: str  # Base64 encoded audio data
+    language_code: str = "en-US"
+
+class OnboardingDataStorage(BaseModel):
+    patient_id: str
+    raw_text_data: str
+    ai_extracted_info: dict
+    voice_transcription: Optional[str] = None
+    file_uploads: Optional[list] = None
+    timestamp: str
+    processing_status: str
+
 # Helper functions
 def fix_id(doc):
     if not doc: return doc
@@ -78,6 +258,244 @@ def fix_id(doc):
 
 def fix_ids(docs):
     return [fix_id(doc) for doc in docs]
+
+# AI extraction function using Claude 3.5 Sonnet
+def extract_medical_info(text):
+    if not text.strip():
+        return {"error": "Please provide some text to analyze."}
+
+    # Claude 3.5 Sonnet requires the Messages API format
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Extract the main medical information from the following text and format it as JSON with these fields: "
+                    "name, age, diagnosis, medications, allergies, notes. If any field is not found, use null.\n\n"
+                    f"Text: {text}\n\n"
+                    "Response (JSON only):"
+                )
+            }
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.1
+    })
+
+    try:
+        response = call_bedrock_with_retry(json.loads(body))
+        result = json.loads(response['body'].read())
+        # For Claude 3.5 Sonnet Messages API, extract the text from the first content part
+        if 'content' in result and isinstance(result['content'], list) and result['content']:
+            output_text = result['content'][0].get('text', str(result))
+        else:
+            output_text = str(result)
+        
+        # Try to parse the JSON response
+        try:
+            # Clean up the response to extract JSON
+            if output_text.strip().startswith('{') and output_text.strip().endswith('}'):
+                extracted_json = json.loads(output_text)
+            else:
+                # Try to find JSON in the response
+                start_idx = output_text.find('{')
+                end_idx = output_text.rfind('}') + 1
+                if start_idx != -1 and end_idx != 0:
+                    json_str = output_text[start_idx:end_idx]
+                    extracted_json = json.loads(json_str)
+                else:
+                    extracted_json = {"raw_response": output_text}
+            
+            return extracted_json
+        except json.JSONDecodeError:
+            return {"raw_response": output_text, "error": "Could not parse JSON response"}
+            
+    except Exception as e:
+        return {"error": f"Error calling Bedrock API: {str(e)}"}
+
+# Simple voice transcription function (placeholder for browser-based speech recognition)
+def transcribe_audio(audio_data: str, language_code: str = "en-US"):
+    # This is a placeholder - actual transcription will be done in the browser
+    # using the Web Speech API
+    return {
+        "transcription": "Voice transcription will be handled by browser's Web Speech API",
+        "confidence": 0.0,
+        "success": True,
+        "note": "Using browser's built-in speech recognition"
+    }
+
+# Voice Agent Processing function
+def process_voice_agent_message(message: str, patient_id: str, history: list = []):
+    """Process voice agent messages and extract actions"""
+    try:
+        # Create a comprehensive prompt for voice agent
+        prompt = f"""
+        You are a helpful AI voice assistant for a senior citizen's health management system. 
+        The user is speaking to you to add medicine reminders or doctor appointments.
+        
+        Patient ID: {patient_id}
+        User Message: "{message}"
+        
+        Your task is to:
+        1. Understand the user's intent
+        2. Extract relevant information (medicine name, dosage, time, date, doctor name, etc.)
+        3. Determine what action to take (add medicine reminder or appointment)
+        4. Provide a helpful response
+        
+        IMPORTANT: For dates, use YYYY-MM-DD format. For times, use HH:MM AM/PM format.
+        
+        Return your response in this JSON format:
+        {{
+            "response": "Your helpful response to the user",
+            "action": "add_medicine" or "add_appointment" or "none",
+            "extracted_data": {{
+                "medicine_name": "name if medicine",
+                "dosage": "dosage if medicine",
+                "frequency": "frequency if medicine (e.g., Once daily, Twice daily, Every morning)",
+                "time": "time in HH:MM AM/PM format",
+                "date": "date in YYYY-MM-DD format",
+                "doctor_name": "doctor name if appointment",
+                "appointment_title": "title if appointment",
+                "notes": "any additional notes"
+            }},
+            "confidence": 0.0-1.0
+        }}
+        
+        Examples:
+        - "Add a medicine reminder for Metformin at 8 AM tomorrow" → add_medicine with date=tomorrow, time=08:00 AM
+        - "Schedule a doctor appointment with Dr. Smith on Friday at 2 PM" → add_appointment with date=friday, time=02:00 PM
+        - "Remind me to take my blood pressure medication every morning" → add_medicine with frequency=Every morning, time=08:00 AM
+        - "Book an appointment with Dr. Johnson next Tuesday at 10 AM" → add_appointment with date=tuesday, time=10:00 AM
+        - "Hello" → none
+        
+        IMPORTANT: For relative dates like "tomorrow", "friday", "tuesday", use the exact word. For times, use HH:MM format.
+        
+        Only return valid JSON, no additional text.
+        """
+        
+        # Use Claude 3.5 Sonnet for voice agent processing
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.1
+        })
+        
+        response = call_bedrock_with_retry(json.loads(body))
+        
+        result = json.loads(response['body'].read())
+        
+        # Extract the response text
+        if 'content' in result and isinstance(result['content'], list) and result['content']:
+            output_text = result['content'][0].get('text', str(result))
+        else:
+            output_text = str(result)
+        
+        # Try to parse the JSON response
+        try:
+            if output_text.strip().startswith('{') and output_text.strip().endswith('}'):
+                parsed_result = json.loads(output_text)
+            else:
+                # Try to find JSON in the response
+                start_idx = output_text.find('{')
+                end_idx = output_text.rfind('}') + 1
+                if start_idx != -1 and end_idx != 0:
+                    json_str = output_text[start_idx:end_idx]
+                    parsed_result = json.loads(json_str)
+                else:
+                    parsed_result = {"response": "I'm sorry, I didn't understand that. Could you please try again?", "action": "none", "extracted_data": {}, "confidence": 0.0}
+            
+            return parsed_result
+        except json.JSONDecodeError:
+            return {"response": "I'm sorry, I didn't understand that. Could you please try again?", "action": "none", "extracted_data": {}, "confidence": 0.0}
+            
+    except Exception as e:
+        return {"response": f"Sorry, I encountered an error: {str(e)}", "action": "none", "extracted_data": {}, "confidence": 0.0}
+
+# AI Medicine Recommendation function
+def recommend_medicines(patient_data: dict):
+    """Use AI to recommend medicines based on patient data"""
+    try:
+        # Create a comprehensive prompt for medicine recommendation
+        prompt = f"""
+        Based on the following patient information, recommend appropriate medications with dosages and schedules.
+        
+        Patient Information:
+        - Name: {patient_data.get('name', 'Unknown')}
+        - Age: {patient_data.get('age', 'Unknown')}
+        - Diagnosis: {patient_data.get('diagnosis', 'None provided')}
+        - Current Medications: {patient_data.get('medications', 'None')}
+        - Allergies: {patient_data.get('allergies', 'None')}
+        - Notes: {patient_data.get('notes', 'None')}
+        
+        Please provide recommendations in the following JSON format:
+        {{
+            "recommended_medicines": [
+                {{
+                    "name": "Medicine Name",
+                    "dosage": "Dosage (e.g., 10mg)",
+                    "frequency": "Frequency (e.g., Twice daily)",
+                    "time": "Best time to take (e.g., Morning, Evening)",
+                    "notes": "Important notes about the medicine",
+                    "reason": "Why this medicine is recommended"
+                }}
+            ],
+            "general_recommendations": "General health recommendations",
+            "warnings": "Any warnings or precautions",
+            "follow_up": "When to follow up with doctor"
+        }}
+        
+        Only return valid JSON, no additional text.
+        """
+        
+        # Use Claude 3.5 Sonnet for medicine recommendation
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.1
+        })
+        
+        response = call_bedrock_with_retry(json.loads(body))
+        
+        result = json.loads(response['body'].read())
+        
+        # Extract the response text
+        if 'content' in result and isinstance(result['content'], list) and result['content']:
+            output_text = result['content'][0].get('text', str(result))
+        else:
+            output_text = str(result)
+        
+        # Try to parse the JSON response
+        try:
+            if output_text.strip().startswith('{') and output_text.strip().endswith('}'):
+                recommendations = json.loads(output_text)
+            else:
+                # Try to find JSON in the response
+                start_idx = output_text.find('{')
+                end_idx = output_text.rfind('}') + 1
+                if start_idx != -1 and end_idx != 0:
+                    json_str = output_text[start_idx:end_idx]
+                    recommendations = json.loads(json_str)
+                else:
+                    recommendations = {"error": "Could not parse AI response", "raw_response": output_text}
+            
+            return recommendations
+        except json.JSONDecodeError:
+            return {"error": "Could not parse JSON response", "raw_response": output_text}
+            
+    except Exception as e:
+        return {"error": f"Error getting medicine recommendations: {str(e)}"}
 
 # Seed data
 def seed_data():
@@ -216,24 +634,71 @@ def update_patient(patient_id: str, update: PatientProfileUpdate):
 
 @app.post("/patient/{patient_id}/onboarding")
 def complete_onboarding(patient_id: str, data: OnboardingData):
+    """Complete onboarding and store data as JSON in MongoDB"""
+    
     # Process the onboarding data and create/update patient profile
-    # For now, we'll use the text data as the summary
     summary = data.summary or data.textData or "Patient information provided during onboarding"
     
-    # Create or update patient profile
+    # Use AI to extract medical information if text data is provided
+    extracted_info = {}
+    if data.textData and data.textData.strip():
+        extracted_info = extract_medical_info(data.textData)
+    
+    # Create comprehensive onboarding data structure for JSON storage
+    onboarding_data = {
+        "_id": f"onboarding_{patient_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        "patient_id": patient_id,
+        "raw_text_data": data.textData or "",
+        "ai_extracted_info": extracted_info,
+        "voice_transcription": None,  # Will be updated if voice data is available
+        "file_uploads": [],
+        "timestamp": datetime.now().isoformat(),
+        "processing_status": "completed",
+        "summary": summary,
+        "metadata": {
+            "source": "onboarding_form",
+            "ai_model": "claude-3-5-sonnet",
+            "extraction_method": "ai_analysis"
+        }
+    }
+    
+    # Store onboarding data as JSON in MongoDB
+    onboarding_col.insert_one(onboarding_data)
+    
+    # Create or update patient profile with AI-extracted information
     patient_data = {
         "_id": patient_id,
-        "name": "New Patient",  # Will be updated from summary later
+        "name": "New Patient",
         "age": None,
         "address": "",
         "phone": "",
         "notes": summary,
         "doctorId": None,
-        "caregiverId": None
+        "caregiverId": None,
+        "ai_extracted_info": extracted_info,
+        "onboarding_data_id": onboarding_data["_id"]  # Reference to stored onboarding data
     }
     
-    # Try to extract basic info from summary (simple parsing)
-    if data.textData:
+    # Update patient data with AI-extracted information if available
+    if extracted_info and not extracted_info.get("error"):
+        if extracted_info.get("name"):
+            patient_data["name"] = extracted_info["name"]
+        if extracted_info.get("age"):
+            try:
+                patient_data["age"] = int(extracted_info["age"])
+            except (ValueError, TypeError):
+                pass
+        if extracted_info.get("diagnosis"):
+            patient_data["diagnosis"] = extracted_info["diagnosis"]
+        if extracted_info.get("medications"):
+            patient_data["medications"] = extracted_info["medications"]
+        if extracted_info.get("allergies"):
+            patient_data["allergies"] = extracted_info["allergies"]
+        if extracted_info.get("notes"):
+            patient_data["notes"] = extracted_info["notes"]
+    
+    # Fallback to simple parsing if AI extraction failed
+    if data.textData and (not extracted_info or extracted_info.get("error")):
         lines = data.textData.split('\n')
         for line in lines:
             line = line.strip().lower()
@@ -255,7 +720,47 @@ def complete_onboarding(patient_id: str, data: OnboardingData):
     # Mark user as profile complete
     users_col.update_one({"_id": patient_id}, {"$set": {"profileComplete": True}})
     
-    return {"message": "Onboarding completed successfully"}
+    return {
+        "message": "Onboarding completed successfully",
+        "ai_extracted_info": extracted_info,
+        "onboarding_id": onboarding_data["_id"],
+        "stored_data": onboarding_data
+    }
+
+@app.post("/ai/analyze")
+def analyze_medical_text(request: AIAnalysisRequest):
+    """Analyze medical text using Claude 3.5 Sonnet"""
+    extracted_info = extract_medical_info(request.text)
+    return AIAnalysisResponse(
+        extracted_info=extracted_info,
+        original_text=request.text
+    )
+
+@app.post("/voice/transcribe")
+def transcribe_voice(request: VoiceTranscriptionRequest):
+    """Transcribe voice to text using Google Speech-to-Text"""
+    result = transcribe_audio(request.audio_data, request.language_code)
+    
+    if result["success"]:
+        # Store transcription in database for logging
+        transcription_log = {
+            "_id": f"trans_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "transcription": result["transcription"],
+            "confidence": result["confidence"],
+            "language_code": request.language_code,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # You can store this in a separate collection if needed
+        # db['transcriptions'].insert_one(transcription_log)
+        
+        return {
+            "transcription": result["transcription"],
+            "confidence": result["confidence"],
+            "success": True
+        }
+    else:
+        raise HTTPException(status_code=400, detail=result["error"])
 
 @app.post("/patient/{patient_id}/reports")
 def upload_report(patient_id: str, file: UploadFile = File(...)):
@@ -369,6 +874,256 @@ def get_appointments(patient_id: str):
 def get_logs(patient_id: str):
     logs = logs_col.find({"patientId": patient_id})
     return fix_ids(logs)
+
+@app.get("/onboarding/{patient_id}")
+def get_onboarding_data(patient_id: str):
+    """Retrieve stored onboarding data as JSON"""
+    onboarding_records = onboarding_col.find({"patient_id": patient_id}).sort("timestamp", -1)
+    return fix_ids(onboarding_records)
+
+@app.get("/onboarding/{patient_id}/latest")
+def get_latest_onboarding_data(patient_id: str):
+    """Retrieve the most recent onboarding data"""
+    latest_record = onboarding_col.find_one(
+        {"patient_id": patient_id}, 
+        sort=[("timestamp", -1)]
+    )
+    return fix_id(latest_record)
+
+@app.post("/patient/{patient_id}/recommend-medicines")
+def get_medicine_recommendations(patient_id: str):
+    """Get AI-powered medicine recommendations based on patient data"""
+    try:
+        # Get patient data
+        patient = patients_col.find_one({"_id": patient_id})
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+        
+        # Get latest onboarding data
+        latest_onboarding = onboarding_col.find_one(
+            {"patient_id": patient_id}, 
+            sort=[("timestamp", -1)]
+        )
+        
+        # Combine patient data with onboarding data
+        combined_data = {
+            "name": patient.get("name", ""),
+            "age": patient.get("age"),
+            "diagnosis": patient.get("diagnosis", ""),
+            "medications": patient.get("medications", ""),
+            "allergies": patient.get("allergies", ""),
+            "notes": patient.get("notes", "")
+        }
+        
+        # Add AI-extracted info from onboarding if available
+        if latest_onboarding and latest_onboarding.get("ai_extracted_info"):
+            ai_info = latest_onboarding["ai_extracted_info"]
+            if ai_info.get("diagnosis"):
+                combined_data["diagnosis"] = ai_info["diagnosis"]
+            if ai_info.get("medications"):
+                combined_data["medications"] = ai_info["medications"]
+            if ai_info.get("allergies"):
+                combined_data["allergies"] = ai_info["allergies"]
+        
+        # Get AI recommendations
+        recommendations = recommend_medicines(combined_data)
+        
+        # Store recommendations in database
+        recommendation_record = {
+            "_id": f"rec_{patient_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "patient_id": patient_id,
+            "patient_data": combined_data,
+            "recommendations": recommendations,
+            "timestamp": datetime.now().isoformat(),
+            "status": "completed"
+        }
+        
+        # Store in a new collection for recommendations
+        db['medicine_recommendations'].insert_one(recommendation_record)
+        
+        return {
+            "patient_data": combined_data,
+            "recommendations": recommendations,
+            "recommendation_id": recommendation_record["_id"]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting recommendations: {str(e)}")
+
+@app.post("/voice-agent/chat")
+def voice_agent_chat(request: VoiceAgentRequest):
+    """Process voice agent messages and perform actions"""
+    try:
+        # Process the voice agent message
+        result = process_voice_agent_message(request.message, request.patient_id, request.history)
+        
+        actions_performed = []
+        
+        # Perform actions based on the result
+        if result.get("action") == "add_medicine" and result.get("confidence", 0) > 0.7:
+            extracted_data = result.get("extracted_data", {})
+            
+            # Parse date - handle relative dates
+            date_str = extracted_data.get("date", "")
+            if not date_str or date_str == "today":
+                target_date = datetime.now().strftime('%Y-%m-%d')
+            elif date_str == "tomorrow":
+                target_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+            elif date_str == "next week":
+                target_date = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+            elif "friday" in date_str.lower():
+                # Calculate next Friday
+                today = datetime.now()
+                days_until_friday = (4 - today.weekday()) % 7
+                if days_until_friday == 0:  # Today is Friday
+                    days_until_friday = 7
+                target_date = (today + timedelta(days=days_until_friday)).strftime('%Y-%m-%d')
+            elif "tuesday" in date_str.lower():
+                # Calculate next Tuesday
+                today = datetime.now()
+                days_until_tuesday = (1 - today.weekday()) % 7
+                if days_until_tuesday == 0:  # Today is Tuesday
+                    days_until_tuesday = 7
+                target_date = (today + timedelta(days=days_until_tuesday)).strftime('%Y-%m-%d')
+            else:
+                # Try to parse the date string
+                try:
+                    target_date = date_str
+                except:
+                    target_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Create medicine record
+            medicine_data = {
+                "_id": f"med_{request.patient_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "patientId": request.patient_id,
+                "name": extracted_data.get("medicine_name", "Unknown Medicine"),
+                "dosage": extracted_data.get("dosage", ""),
+                "frequency": extracted_data.get("frequency", "Once daily"),
+                "time": extracted_data.get("time", "08:00 AM"),
+                "date": target_date,
+                "notes": extracted_data.get("notes", "Added via voice assistant")
+            }
+            
+            medicines_col.insert_one(medicine_data)
+            actions_performed.append("medicine_added")
+            
+        elif result.get("action") == "add_appointment" and result.get("confidence", 0) > 0.7:
+            extracted_data = result.get("extracted_data", {})
+            
+            # Parse date - handle relative dates
+            date_str = extracted_data.get("date", "")
+            if not date_str or date_str == "today":
+                target_date = datetime.now().strftime('%Y-%m-%d')
+            elif date_str == "tomorrow":
+                target_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+            elif date_str == "next week":
+                target_date = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+            elif "friday" in date_str.lower():
+                # Calculate next Friday
+                today = datetime.now()
+                days_until_friday = (4 - today.weekday()) % 7
+                if days_until_friday == 0:  # Today is Friday
+                    days_until_friday = 7
+                target_date = (today + timedelta(days=days_until_friday)).strftime('%Y-%m-%d')
+            elif "tuesday" in date_str.lower():
+                # Calculate next Tuesday
+                today = datetime.now()
+                days_until_tuesday = (1 - today.weekday()) % 7
+                if days_until_tuesday == 0:  # Today is Tuesday
+                    days_until_tuesday = 7
+                target_date = (today + timedelta(days=days_until_tuesday)).strftime('%Y-%m-%d')
+            else:
+                # Try to parse the date string
+                try:
+                    target_date = date_str
+                except:
+                    target_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Create appointment record
+            appointment_data = {
+                "_id": f"app_{request.patient_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "patientId": request.patient_id,
+                "title": extracted_data.get("appointment_title", "Doctor Appointment"),
+                "date": target_date,
+                "time": extracted_data.get("time", "09:00 AM"),
+                "doctor": extracted_data.get("doctor_name", "Doctor"),
+                "notes": extracted_data.get("notes", "Scheduled via voice assistant")
+            }
+            
+            # Try to schedule with NLX first
+            nlx_result = schedule_nlx_appointment(appointment_data)
+            
+            if nlx_result.get("success"):
+                # NLX scheduling successful
+                appointment_data["nlx_appointment_id"] = nlx_result.get("nlx_appointment_id")
+                appointment_data["nlx_confirmation"] = nlx_result.get("confirmation")
+                appointment_data["nlx_calendar_link"] = nlx_result.get("calendar_link")
+                appointment_data["scheduled_with"] = "NLX"
+                actions_performed.append("appointment_scheduled_with_nlx")
+            else:
+                # Fallback to local database only
+                appointment_data["scheduled_with"] = "local_database"
+                appointment_data["nlx_error"] = nlx_result.get("error")
+                actions_performed.append("appointment_added_local_only")
+            
+            appointments_col.insert_one(appointment_data)
+        
+        return {
+            "response": result.get("response", "I'm sorry, I didn't understand that."),
+            "action": result.get("action", "none"),
+            "confidence": result.get("confidence", 0.0),
+            "actions_performed": actions_performed,
+            "nlx_enabled": NLX_ENABLED
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing voice agent message: {str(e)}")
+
+@app.get("/nlx/status")
+def get_nlx_status():
+    """Check NLX API status and configuration"""
+    return {
+        "nlx_enabled": NLX_ENABLED,
+        "api_key_configured": bool(NLX_API_KEY),
+        "base_url": NLX_BASE_URL
+    }
+
+@app.get("/nlx/available-slots/{doctor_name}")
+def get_available_slots(doctor_name: str, date: str = None):
+    """Get available appointment slots for a doctor"""
+    if not NLX_ENABLED:
+        raise HTTPException(status_code=400, detail="NLX API not configured")
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {NLX_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        nlx_payload = {
+            "deploymentKey": NLX_DEPLOYMENT_KEY,
+            "channelKey": NLX_CHANNEL_KEY,
+            "input": {
+                "message": f"Get available appointment slots for Dr {doctor_name} on {date or datetime.now().strftime('%Y-%m-%d')}",
+                "doctor_name": doctor_name,
+                "date": date or datetime.now().strftime('%Y-%m-%d')
+            }
+        }
+        
+        response = requests.post(
+            f"{NLX_BASE_URL}/api/chat",
+            json=nlx_payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise HTTPException(status_code=response.status_code, detail=f"NLX API error: {response.text}")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting available slots: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
